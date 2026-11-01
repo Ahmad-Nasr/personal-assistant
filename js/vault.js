@@ -109,6 +109,11 @@ export const vault = {
     return this.read();
   },
 
+  async checkPassword(pw) {
+    const kek = await pwKek(meta.username, pw, b64.from(meta.salt), meta.iter);
+    try { await unwrap(meta.pw, kek); } catch { throw new Error('Wrong password'); }
+  },
+
   async changePassword(oldPw, newPw) {
     const oldKek = await pwKek(meta.username, oldPw, b64.from(meta.salt), meta.iter);
     try { await unwrap(meta.pw, oldKek); } catch { throw new Error('Current password is wrong'); }
@@ -185,6 +190,23 @@ export const vault = {
   },
   lock() { DEK = null; },
   async wipe() { DEK = null; meta = null; await kvClear(); },
+
+  // ---------- Helpers for cloud sync ----------
+  // Encrypted blobs and secrets (sync session) use the same in-memory data key.
+  encrypt(obj) { if (!DEK) throw new Error('Locked'); return encryptJSON(obj, DEK); },
+  decrypt(blob) { if (!DEK) throw new Error('Locked'); return decryptJSON(blob, DEK); },
+  async getSecret(name) { const b = await kvGet('secret:' + name); return b && DEK ? decryptJSON(b, DEK) : null; },
+  async setSecret(name, obj) { await kvSet('secret:' + name, obj == null ? null : await encryptJSON(obj, DEK)); },
+  // The part of meta that is safe and useful to store in the cloud (no device passkey).
+  cloudMeta() { const { passkey, ...rest } = meta; return rest; },
+  async adoptCloudMeta(m) { meta = { ...m, passkey: null }; await kvSet('meta', meta); },
+  // Login secret for the sync server, derived one-way from the app password with its own salt,
+  // so the server never sees anything that can decrypt the data.
+  async authSecret(email, password) {
+    const base = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('pa-auth-v1|' + email.trim().toLowerCase()), iterations: PBKDF2_ITER }, base, 256);
+    return b64.to(bits);
+  },
 
   // ---------- Backups (encrypted with a separate backup password) ----------
   async exportBackup(data, password) {

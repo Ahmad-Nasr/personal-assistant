@@ -1,4 +1,5 @@
 import { vault } from './vault.js';
+import * as cloud from './sync.js';
 import {
   defaultData, uid, TARGET_GROUPS, DEFAULT_ACCOUNT_TYPES, toDisplay, fromInput, fmtG, status, STATUS_LABEL,
   glucoseStats, fmtMoney, accountBalance, totalsByCurrency, dayKey, monthKey, localInputValue, suggestReadingType,
@@ -18,10 +19,42 @@ const ui = {
 let charts = [];
 
 // ---------------- Persistence ----------------
-let saveTimer = null;
+let saveTimer = null, syncTimer = null, lastSettingsJSON = '';
 function persist() {
+  const sj = JSON.stringify([D.settings, D.profile]);
+  if (lastSettingsJSON && sj !== lastSettingsJSON) D.su = Date.now();
+  lastSettingsJSON = sj;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => vault.save(D).catch((e) => toast('Save failed: ' + e.message)), 150);
+  if (cloud.syncOn()) { cloud.markDirty(); scheduleSync(2500); }
+}
+function scheduleSync(ms = 0) {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => runSync(), ms);
+}
+const getD = () => D;
+function setD(d) {
+  if (!D) return;
+  D = d;
+  lastSettingsJSON = JSON.stringify([D.settings, D.profile]);
+  vault.save(D).catch(() => {});
+}
+async function runSync() {
+  if (!D || !cloud.syncOn()) return;
+  const before = JSON.stringify(D);
+  await cloud.sync(getD, setD);
+  // refresh the screen if new data arrived, unless the person is in the middle of a form
+  if (D && JSON.stringify(D) !== before && !$('#sheet-wrap').classList.contains('open')) render(true);
+}
+// Record helpers: stamp updates and keep tombstones so deletions sync across devices.
+function upsert(coll, rec) {
+  rec.u = Date.now();
+  const i = D[coll].findIndex((x) => x.id === rec.id);
+  if (i >= 0) D[coll][i] = rec; else D[coll].push(rec);
+}
+function remove(coll, id) {
+  D[coll] = D[coll].filter((x) => x.id !== id);
+  D.tomb = { ...(D.tomb || {}), [id]: Date.now() };
 }
 function commit() { persist(); render(); }
 
@@ -133,12 +166,14 @@ function renderSetup() {
       <div class="err" id="s-err"></div>
       <button class="btn primary block" id="s-go">Create my secure space</button>
     </form>
-    <p class="center small muted" style="margin-top:4px">Already have a backup? <button class="link" id="s-restore">Restore it</button></p>
+    ${cloud.syncAvailable() ? '<button class="btn block" id="s-cloud" style="margin-bottom:12px">☁️ I already use the app: sign in with my cloud account</button>' : ''}
+    <p class="center small muted" style="margin-top:4px">Have a backup file? <button class="link" id="s-restore">Restore it</button></p>
   </div>`;
   bindEyes(appEl);
   const colors = ['#d64545', '#d68a00', '#c9a227', '#1f9d6b', '#1f9d6b'];
   $('#s-pw').oninput = (e) => { const s = pwScore(e.target.value); const i = $('#s-str'); i.style.width = (s + 1) * 20 + '%'; i.style.background = colors[s]; };
   $('#s-restore').onclick = () => restoreFlow(true);
+  $('#s-cloud')?.addEventListener('click', cloudSignInFlow);
   $('#setup').onsubmit = async (e) => {
     e.preventDefault();
     const name = $('#s-name').value.trim(), user = $('#s-user').value.trim(), pw = $('#s-pw').value;
@@ -224,11 +259,16 @@ function migrate(data) {
 // ---------------- Session / auto-lock ----------------
 let lastActive = Date.now();
 let hiddenAt = null;
-function startSession() { lastActive = Date.now(); applyTheme(); }
+function startSession() {
+  lastActive = Date.now(); applyTheme();
+  lastSettingsJSON = JSON.stringify([D.settings, D.profile]);
+  cloud.resume().then(() => scheduleSync(300)).catch(() => {});
+}
+setInterval(() => { if (D && !document.hidden) runSync(); }, 60000);
 function lockNow() {
   if (!vault.unlocked) return;
   clearTimeout(saveTimer);
-  vault.save(D).finally(() => { vault.lock(); D = null; closeSheet(); destroyCharts(); render(); });
+  vault.save(D).finally(() => { vault.lock(); cloud.lockReset(); D = null; closeSheet(); destroyCharts(); render(); });
 }
 ['pointerdown', 'keydown', 'touchstart', 'scroll'].forEach((ev) => addEventListener(ev, () => { lastActive = Date.now(); }, { passive: true }));
 setInterval(() => {
@@ -238,10 +278,11 @@ setInterval(() => {
 }, 15000);
 document.addEventListener('visibilitychange', () => {
   if (!vault.unlocked || !D) return;
-  if (document.hidden) { hiddenAt = Date.now(); if (saveTimer) { clearTimeout(saveTimer); vault.save(D); } }
+  if (document.hidden) { hiddenAt = Date.now(); if (saveTimer) { clearTimeout(saveTimer); vault.save(D); } if (cloud.syncOn()) runSync(); }
   else if (hiddenAt) {
     const mins = D.settings.autoLockMin;
     if (mins === 0 || (mins > 0 && Date.now() - hiddenAt > mins * 60000)) lockNow();
+    else scheduleSync(200);
     hiddenAt = null;
   }
 });
@@ -258,7 +299,8 @@ function setChrome(tabs, active) {
   appEl.classList.toggle('no-tabs', !tabs);
   $$('#tabbar a').forEach((a) => a.classList.toggle('on', a.dataset.tab === active));
 }
-async function render() {
+async function render(keepScroll = false) {
+  const y = scrollY;
   destroyCharts();
   if (!vault.meta) return renderSetup();
   if (!vault.unlocked || !D) return renderLock();
@@ -267,9 +309,9 @@ async function render() {
   const view = views[route] || viewHome;
   setChrome(true, route === 'settings' ? '' : route);
   view(sub);
-  window.scrollTo?.(0, 0);
+  window.scrollTo?.(0, keepScroll === true ? y : 0);
 }
-addEventListener('hashchange', render);
+addEventListener('hashchange', () => render());
 $('#fab').onclick = () => quickAdd();
 
 function header(title, sub, right = '') {
@@ -510,7 +552,7 @@ function glucoseForm(r) {
       if (b.dataset.x === 'newtype') return typeForm(null, () => glucoseForm({ ...r, v: fromInput(parseFloat(vEl.value) || 0, u) || undefined }));
       sel = b.dataset.t; $$('#g-types button', s).forEach((x) => x.classList.toggle('on', x === b)); upd();
     };
-    $('[data-x=del]', s)?.addEventListener('click', () => confirmSheet('Delete reading?', 'This can\'t be undone.', 'Delete', () => { D.readings = D.readings.filter((x) => x.id !== r.id); commit(); toast('Reading deleted'); }));
+    $('[data-x=del]', s)?.addEventListener('click', () => confirmSheet('Delete reading?', 'This can\'t be undone.', 'Delete', () => { remove('readings', r.id); commit(); toast('Reading deleted'); }));
     $('#gf', s).onsubmit = (e) => {
       e.preventDefault();
       const v = parseFloat(vEl.value);
@@ -522,7 +564,7 @@ function glucoseForm(r) {
         insulin: num('#g-ins'), insulinType: $('#g-inst', s).value || undefined, carbs: num('#g-carbs'),
         meds: $('#g-meds', s).value.trim() || undefined, note: $('#g-note', s).value.trim() || undefined,
       };
-      D.readings = D.readings.filter((x) => x.id !== rec.id).concat(rec);
+      upsert('readings', rec);
       closeSheet(); commit();
       const st = status(rec.v, rec.type, D);
       toast(st === 'low' ? '⚠️ Low reading. Follow your hypo plan (e.g. 15g fast sugar) and recheck in 15 min.' : st === 'veryhigh' ? '⚠️ Very high reading. Follow your doctor\'s plan.' : 'Reading saved');
@@ -544,13 +586,12 @@ function typeForm(t, back) {
     </form>`, (s) => {
     $('[data-x=del]', s)?.addEventListener('click', () => {
       if (D.readings.some((r) => r.type === t.id)) return toast('This type has readings, so it can\'t be deleted');
-      D.readingTypes = D.readingTypes.filter((x) => x.id !== t.id); commit(); closeSheet(); back?.();
+      remove('readingTypes', t.id); commit(); closeSheet(); back?.();
     });
     $('#tf', s).onsubmit = (e) => {
       e.preventDefault();
       const rec = { id: t.id || uid(), name: $('#t-name', s).value.trim(), icon: $('#t-icon', s).value.trim() || '🩸', group: $('#t-group', s).value };
-      const i = D.readingTypes.findIndex((x) => x.id === rec.id);
-      if (i >= 0) D.readingTypes[i] = rec; else D.readingTypes.push(rec);
+      upsert('readingTypes', rec);
       persist(); closeSheet(); back ? back() : render();
     };
   });
@@ -675,7 +716,7 @@ function txnForm(kind, t) {
       draw(s);
     };
     $('#t-acc', s).onchange = () => draw(s);
-    $('[data-x=del]', s)?.addEventListener('click', () => confirmSheet('Delete transaction?', 'This can\'t be undone.', 'Delete', () => { D.txns = D.txns.filter((x) => x.id !== t.id); commit(); toast('Deleted'); }));
+    $('[data-x=del]', s)?.addEventListener('click', () => confirmSheet('Delete transaction?', 'This can\'t be undone.', 'Delete', () => { remove('txns', t.id); commit(); toast('Deleted'); }));
     $('#tf', s).onsubmit = (e) => {
       e.preventDefault();
       const err = $('#t-err', s);
@@ -697,7 +738,7 @@ function txnForm(kind, t) {
         D.settings['lastCat_' + k] = selCat;
       }
       D.settings.lastAccount = rec.accountId;
-      D.txns = D.txns.filter((x) => x.id !== rec.id).concat(rec);
+      upsert('txns', rec);
       closeSheet(); commit(); toast('Saved');
     };
   });
@@ -717,13 +758,12 @@ function accountForm(a, back) {
     </form>`, (s) => {
     $('[data-x=del]', s)?.addEventListener('click', () => {
       if (D.txns.some((t) => t.accountId === a.id || t.toAccountId === a.id)) return toast('This account has transactions. Archive it instead.');
-      D.accounts = D.accounts.filter((x) => x.id !== a.id); commit(); closeSheet(); back?.();
+      remove('accounts', a.id); commit(); closeSheet(); back?.();
     });
     $('#af', s).onsubmit = (e) => {
       e.preventDefault();
       const rec = { ...a, id: a.id || uid(), name: $('#a-name', s).value.trim(), type: $('#a-type', s).value, currency: $('#a-cur', s).value, opening: parseFloat($('#a-open', s).value) || 0, archived: $('#a-arch', s)?.checked || undefined };
-      const i = D.accounts.findIndex((x) => x.id === rec.id);
-      if (i >= 0) D.accounts[i] = rec; else D.accounts.push(rec);
+      upsert('accounts', rec);
       closeSheet(); commit(); back?.(); toast('Account saved');
     };
   });
@@ -749,13 +789,12 @@ function categoryForm(c, back) {
     $('.seg', s).onclick = (e) => { const b = e.target.closest('button'); if (!b) return; kind = b.dataset.v; $$('.seg button', s).forEach((x) => x.classList.toggle('on', x === b)); sync(); };
     $('[data-x=del]', s)?.addEventListener('click', () => {
       if (D.txns.some((t) => t.categoryId === c.id)) return toast('This category is in use and can\'t be deleted');
-      D.categories = D.categories.filter((x) => x.id !== c.id); commit(); closeSheet(); back?.();
+      remove('categories', c.id); commit(); closeSheet(); back?.();
     });
     $('#cf', s).onsubmit = (e) => {
       e.preventDefault();
       const rec = { ...c, id: c.id || uid(), kind, name: $('#c-name', s).value.trim(), icon: $('#c-icon', s).value.trim() || '🏷️', color: $('#c-color', s).value, budget: parseFloat($('#c-bud', s).value) || 0 };
-      const i = D.categories.findIndex((x) => x.id === rec.id);
-      if (i >= 0) D.categories[i] = rec; else D.categories.push(rec);
+      upsert('categories', rec);
       persist(); closeSheet(); back ? back() : render();
     };
   });
@@ -944,6 +983,13 @@ function viewSettings(sub) {
     ${item('🏦', 'Accounts', null, 'data-go="settings/accounts"')}
     ${item('🗂️', 'Categories & budgets', null, 'data-go="settings/cats"')}
   </section>
+  ${cloud.syncAvailable() ? `<section class="card"><h2>☁️ Cloud sync</h2>
+    ${cloud.syncOn() ? `
+      ${item(syncIcon(), `<div>${esc(cloud.syncState.session.email)}</div><div class="small muted" id="sync-line">${syncLine()}</div>`, `<span class="chev">↻</span>`, 'data-act="sync-now"')}
+      ${item('⛔', 'Turn off sync on this device', null, 'data-act="sync-off"')}`
+    : `<p class="small muted" style="margin:0 0 10px">Keep an encrypted copy in your cloud account and use the app on more than one device. The server can't read your data.</p>
+      <button class="btn primary block" data-act="sync-on">Turn on cloud sync</button>`}
+  </section>` : ''}
   <section class="card"><h2>Security</h2>
     ${item('👆', 'Fingerprint / Face ID unlock', `<label class="switch"><input type="checkbox" id="st-finger" ${vault.meta.passkey ? 'checked' : ''}><i></i></label>`, '')}
     ${item('⏱️', 'Auto-lock', `<select class="input" id="st-lock" style="width:auto;min-height:38px;padding:6px 34px 6px 10px">${[[0, 'Immediately'], [1, '1 min'], [3, '3 min'], [5, '5 min'], [15, '15 min']].map(([v, l]) => `<option value="${v}" ${S.autoLockMin === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`, '')}
@@ -992,6 +1038,9 @@ function viewSettings(sub) {
       [...D.txns].sort((a, b) => new Date(a.t) - new Date(b.t)).forEach((t) => rows.push([dayKey(t.t), timeStr(t.t), t.kind, t.amount, curOf(t), acct(t.accountId)?.name, acct(t.toAccountId)?.name ?? '', t.toAmount ?? '', t.categoryId ? cat(t.categoryId).name : '', t.payee ?? '', t.note ?? '']));
       download(`transactions-${dayKey(new Date())}.csv`, '﻿' + rows.map((r) => r.map(csvCell).join(',')).join('\n'), 'text/csv');
     },
+    'sync-on': syncOnForm,
+    'sync-now': async () => { await runSync(); const l = $('#sync-line'); if (l) l.innerHTML = syncLine(); toast(cloud.syncState.status === 'idle' ? 'Synced' : cloud.syncState.error || 'Sync failed'); },
+    'sync-off': () => confirmSheet('Turn off cloud sync?', 'This device stops syncing. Your data stays on this device and in the cloud.', 'Turn off', async () => { await cloud.disconnect(); render(); toast('Cloud sync is off'); }, false),
     wipe: () => confirmSheet('Delete all data?', 'All readings, transactions and settings on this device will be permanently deleted. Download a backup first if you want to keep them.', 'Delete everything',
       async () => { await vault.wipe(); D = null; location.hash = ''; render(); }),
   };
@@ -1065,8 +1114,68 @@ function changePwForm() {
       if (n.length < 8) return ($('#p-err', s).textContent = 'At least 8 characters.');
       if (n !== $('#p-new2', s).value) return ($('#p-err', s).textContent = 'Passwords don\'t match.');
       $('#p-go', s).disabled = true;
-      try { await vault.changePassword($('#p-old', s).value, n); closeSheet(); toast('Password changed'); }
+      try {
+        await vault.changePassword($('#p-old', s).value, n);
+        if (cloud.syncOn()) await cloud.passwordChanged(n, getD, setD).catch(() => toast('Password changed here, but the cloud could not be updated. Check your connection and change it again.'));
+        closeSheet(); toast('Password changed');
+      }
       catch (ex) { $('#p-err', s).textContent = ex.message; $('#p-go', s).disabled = false; }
+    };
+  });
+}
+
+function syncIcon() { return { idle: '✅', syncing: '🔄', offline: '📴', error: '⚠️' }[cloud.syncState.status] || '☁️'; }
+function syncLine() {
+  const st = cloud.syncState, last = st.session?.lastSync;
+  if (st.status === 'syncing') return 'Syncing…';
+  if (st.status === 'offline') return 'Offline. Will sync when you\'re back online.';
+  if (st.status === 'error') return esc(st.error);
+  return last ? `Synced ${new Date(last).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}. Tap to sync now.` : 'Tap to sync now.';
+}
+cloud.onSync(() => { const l = $('#sync-line'); if (l) l.innerHTML = syncLine(); });
+
+function syncOnForm() {
+  openSheet(`<h3>Turn on cloud sync</h3>
+    <p class="muted small">Use the same email on every device. Your app password protects the cloud copy too, and only scrambled, encrypted data is uploaded.</p>
+    <form id="sf">
+      <label class="f"><span>Email</span><input class="input" id="sy-email" type="email" autocomplete="email" autocapitalize="none" required></label>
+      <label class="f"><span>Your app password</span>${pwField('sy-pw', 'App password', 'current-password')}</label>
+      <div class="err" id="sy-err"></div><button class="btn primary block" id="sy-go">Turn on</button></form>`, (s) => {
+    bindEyes(s);
+    $('#sf', s).onsubmit = async (e) => {
+      e.preventDefault();
+      const btn = $('#sy-go', s); btn.disabled = true; btn.textContent = 'Connecting…';
+      try {
+        const pw = $('#sy-pw', s).value;
+        await vault.checkPassword(pw);
+        await cloud.connect($('#sy-email', s).value.trim(), pw, getD, setD);
+        closeSheet(); render(); toast('Cloud sync is on');
+      } catch (ex) { $('#sy-err', s).textContent = ex.message; btn.disabled = false; btn.textContent = 'Turn on'; }
+    };
+  });
+}
+
+function cloudSignInFlow() {
+  openSheet(`<h3>Sign in with your cloud account</h3>
+    <p class="muted small">Use this on a new phone or computer. Enter the email you used for sync and your app username and password.</p>
+    <form id="cs">
+      <label class="f"><span>Email</span><input class="input" id="cs-email" type="email" autocomplete="email" autocapitalize="none" required></label>
+      <label class="f"><span>Username</span><input class="input" id="cs-user" autocomplete="username" autocapitalize="none" required></label>
+      <label class="f"><span>Password</span>${pwField('cs-pw', 'App password', 'current-password')}</label>
+      <div class="err" id="cs-err"></div><button class="btn primary block" id="cs-go">Sign in</button></form>`, (s) => {
+    bindEyes(s);
+    $('#cs', s).onsubmit = async (e) => {
+      e.preventDefault();
+      const btn = $('#cs-go', s); btn.disabled = true; btn.textContent = 'Downloading your data…';
+      try {
+        const data = await cloud.restoreFromCloud($('#cs-email', s).value.trim(), $('#cs-user', s).value, $('#cs-pw', s).value);
+        D = migrate(data);
+        closeSheet(); startSession(); location.hash = '#/home'; render(); toast('Welcome back! Your data is synced.');
+        if (await vault.passkeySupported()) offerPasskey();
+      } catch (ex) {
+        $('#cs-err', s).textContent = /invalid|credentials/i.test(ex.message) ? 'Wrong email or password.' : ex.message;
+        btn.disabled = false; btn.textContent = 'Sign in';
+      }
     };
   });
 }
@@ -1115,7 +1224,7 @@ function restoreFlow(fromSetup) {
           await vault.create($('#r-user', s).value, pw, D);
           startSession();
         } else {
-          D = migrate(data); await vault.save(D); applyTheme();
+          D = migrate(data); await vault.save(D); applyTheme(); if (cloud.syncOn()) { cloud.markDirty(); scheduleSync(500); }
         }
         closeSheet(); location.hash = '#/home'; render(); toast('Backup restored');
       } catch (ex) { err.textContent = ex instanceof SyntaxError ? 'That file isn\'t a valid backup.' : ex.message; }

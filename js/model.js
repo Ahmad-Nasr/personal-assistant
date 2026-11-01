@@ -85,6 +85,8 @@ export function defaultData({ name, currency }) {
     accounts: [{ id: uid(), name: 'Cash', type: 'cash', currency, opening: 0 }],
     categories: DEFAULT_CATEGORIES.map((c) => ({ ...c })),
     txns: [],
+    tomb: {},
+    su: 0,
   };
 }
 
@@ -181,4 +183,34 @@ export function suggestReadingType(date = new Date()) {
   if (h >= 17.5 && h < 20) return 'pre_dinner';
   if (h >= 20 && h < 22.5) return 'post_dinner';
   return 'bedtime';
+}
+
+// ---------- Sync merge ----------
+// Records carry `u` (last-updated ms). Deletions are kept as tombstones in `tomb` {id: ms}.
+// Settings/profile carry one timestamp `su`; the newer side wins.
+export const COLLECTIONS = ['readings', 'txns', 'accounts', 'categories', 'readingTypes'];
+export function mergeData(local, remote) {
+  if (!remote) return local;
+  const out = { ...local };
+  const tomb = { ...(remote.tomb || {}) };
+  for (const [id, t] of Object.entries(local.tomb || {})) tomb[id] = Math.max(t, tomb[id] || 0);
+  const cutoff = Date.now() - 365 * 864e5;
+  for (const id of Object.keys(tomb)) if (tomb[id] < cutoff) delete tomb[id];
+  for (const c of COLLECTIONS) {
+    const map = new Map();
+    for (const r of remote[c] || []) map.set(r.id, r);
+    for (const r of local[c] || []) {
+      const o = map.get(r.id);
+      if (!o || (r.u || 0) >= (o.u || 0)) map.set(r.id, r);
+    }
+    // keep local ordering first, then records only present remotely
+    const order = [...(local[c] || []).map((r) => r.id), ...(remote[c] || []).map((r) => r.id)];
+    const seen = new Set();
+    out[c] = order.filter((id) => !seen.has(id) && seen.add(id))
+      .map((id) => map.get(id))
+      .filter((r) => !(tomb[r.id] >= (r.u || 0)));
+  }
+  if ((remote.su || 0) > (local.su || 0)) { out.settings = remote.settings; out.profile = remote.profile; out.su = remote.su; }
+  out.tomb = tomb;
+  return out;
 }

@@ -1,0 +1,20 @@
+# Pings the Supabase database every 3 days so the free plan doesn't pause it for inactivity.
+# It only runs a harmless read with the public anon key (which returns nothing because of row-level security).
+name: Keep Supabase awake
+on:
+  schedule:
+    - cron: '17 6 */3 * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ping Supabase
+        run: |
+          URL=$(sed -n "s/.*supabaseUrl: '\(.*\)'.*/\1/p" js/config.js)
+          KEY=$(sed -n "s/.*supabaseAnonKey: '\(.*\)'.*/\1/p" js/config.js)
+          if [ -z "$URL" ] || [ -z "$KEY" ]; then echo "Supabase not configured yet"; exit 0; fi
+          curl -fsS "$URL/rest/v1/vault?select=rev&limit=1" -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -o /dev/null -w "HTTP %{http_code}\n"
